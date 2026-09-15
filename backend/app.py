@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import sqlite3
+import base64
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +14,8 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
 DATABASE = Path(os.environ.get("SHUKRIYA_DB", ROOT / "shukriya.db"))
+PRIVATE_STORAGE = Path(os.environ.get("SHUKRIYA_PRIVATE_STORAGE", ROOT / "private_storage"))
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 SESSIONS: dict[str, int] = {}
 
 
@@ -40,6 +43,7 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def initialise() -> None:
+    PRIVATE_STORAGE.mkdir(mode=0o700, parents=True, exist_ok=True)
     with connection() as database:
         database.executescript(
             """
@@ -95,10 +99,31 @@ def seed_admin() -> None:
 
 def body(request: BaseHTTPRequestHandler) -> dict:
     length = int(request.headers.get("Content-Length", "0"))
-    if length > 1_000_000:
+    if length > 14_000_000:
         raise ValueError("Request body too large")
     raw = request.rfile.read(length)
     return json.loads(raw or b"{}")
+
+
+def clean_filename(filename: str) -> str:
+    name = Path(filename).name.strip()
+    if not name or len(name) > 180:
+        raise ValueError("A valid filename is required")
+    return name
+
+
+def document_bytes(payload: dict) -> tuple[str, bytes]:
+    filename = clean_filename(str(payload.get("filename", "")))
+    extension = Path(filename).suffix.lower()
+    if extension not in {".pdf", ".jpg", ".jpeg", ".png", ".webp"}:
+        raise ValueError("Only PDF, JPG, PNG and WEBP documents are accepted")
+    try:
+        content = base64.b64decode(str(payload.get("content_base64", "")), validate=True)
+    except (ValueError, TypeError):
+        raise ValueError("content_base64 must be valid base64") from None
+    if not content or len(content) > MAX_DOCUMENT_BYTES:
+        raise ValueError("Document must be between 1 byte and 10 MB")
+    return filename, content
 
 
 class API(BaseHTTPRequestHandler):
@@ -144,6 +169,25 @@ class API(BaseHTTPRequestHandler):
                 cases = database.execute("SELECT * FROM cases ORDER BY updated_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"cases": [dict(case) for case in cases]})
             return
+        if path == "/api/documents":
+            if not self.require_user():
+                return
+            reference = urlparse(self.path).query
+            query_reference = reference.removeprefix("case_reference=") if reference.startswith("case_reference=") else ""
+            with connection() as database:
+                if query_reference:
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE case_reference = ? ORDER BY created_at DESC", (query_reference,)).fetchall()
+                else:
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents ORDER BY created_at DESC").fetchall()
+            self.send_json(HTTPStatus.OK, {"documents": [dict(document) for document in documents]})
+            return
+        if path == "/api/invoices":
+            if not self.require_user():
+                return
+            with connection() as database:
+                invoices = database.execute("SELECT id, invoice_number, case_reference, amount_paise, currency, status, created_at FROM invoices ORDER BY created_at DESC").fetchall()
+            self.send_json(HTTPStatus.OK, {"invoices": [dict(invoice) for invoice in invoices]})
+            return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:
@@ -184,6 +228,55 @@ class API(BaseHTTPRequestHandler):
             with connection() as database:
                 database.execute("INSERT INTO cases (reference, service, applicant_name, mobile, status, notes) VALUES (?, ?, ?, ?, ?, ?)", tuple(payload.get(field, "") for field in ("reference", "service", "applicant_name", "mobile", "status", "notes")))
             self.send_json(HTTPStatus.CREATED, {"created": True, "reference": payload["reference"]})
+            return
+        if path == "/api/documents":
+            if not self.require_user():
+                return
+            try:
+                filename, content = document_bytes(payload)
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                return
+            case_reference = str(payload.get("case_reference", "")).strip()
+            if not case_reference:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "case_reference is required"})
+                return
+            storage_key = f"{secrets.token_urlsafe(18)}{Path(filename).suffix.lower()}"
+            (PRIVATE_STORAGE / storage_key).write_bytes(content)
+            with connection() as database:
+                database.execute("INSERT INTO documents (case_reference, filename, storage_key) VALUES (?, ?, ?)", (case_reference, filename, storage_key))
+            self.send_json(HTTPStatus.CREATED, {"uploaded": True, "case_reference": case_reference, "filename": filename})
+            return
+        if path == "/api/invoices":
+            if not self.require_user():
+                return
+            case_reference = str(payload.get("case_reference", "")).strip()
+            amount_paise = int(payload.get("amount_paise", 0))
+            if not case_reference or amount_paise <= 0:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "case_reference and a positive amount_paise are required"})
+                return
+            invoice_number = f"SHK-{secrets.token_hex(4).upper()}"
+            with connection() as database:
+                database.execute("INSERT INTO invoices (invoice_number, case_reference, amount_paise, currency, status) VALUES (?, ?, ?, ?, 'draft')", (invoice_number, case_reference, amount_paise, str(payload.get("currency", "INR")).upper()))
+            self.send_json(HTTPStatus.CREATED, {"created": True, "invoice_number": invoice_number, "status": "draft"})
+            return
+        if path == "/api/payments/status":
+            if not self.require_user():
+                return
+            invoice_number = str(payload.get("invoice_number", "")).strip()
+            status = str(payload.get("status", "")).strip().lower()
+            if status not in {"draft", "pending", "paid", "failed", "refunded"} or not invoice_number:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invoice_number and a valid payment status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE invoices SET status = ? WHERE invoice_number = ?", (status, invoice_number))
+            self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "invoice_number": invoice_number, "status": status, "provider": os.environ.get("SHUKRIYA_PAYMENT_PROVIDER", "unconfigured")})
+            return
+        if path == "/api/whatsapp/status":
+            if not self.require_user():
+                return
+            configured = bool(os.environ.get("WHATSAPP_ACCESS_TOKEN") and os.environ.get("WHATSAPP_PHONE_NUMBER_ID"))
+            self.send_json(HTTPStatus.OK, {"configured": configured, "provider": "whatsapp-cloud-api" if configured else "unconfigured", "message": "Configure WhatsApp environment variables before enabling automated messages."})
             return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
