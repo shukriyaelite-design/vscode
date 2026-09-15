@@ -93,6 +93,37 @@ def initialise() -> None:
                 status TEXT NOT NULL DEFAULT 'draft',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS agencies (
+                id INTEGER PRIMARY KEY,
+                legal_name TEXT NOT NULL,
+                business_email TEXT UNIQUE NOT NULL,
+                mobile TEXT NOT NULL,
+                gst_number TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                credit_limit_paise INTEGER NOT NULL DEFAULT 0,
+                wallet_paise INTEGER NOT NULL DEFAULT 0,
+                pricing_json TEXT NOT NULL DEFAULT '{}',
+                approved_by TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS agency_members (
+                user_id INTEGER PRIMARY KEY,
+                agency_id INTEGER NOT NULL,
+                agency_role TEXT NOT NULL DEFAULT 'owner'
+            );
+            CREATE TABLE IF NOT EXISTS agency_applications (
+                id INTEGER PRIMARY KEY,
+                reference TEXT UNIQUE NOT NULL,
+                agency_id INTEGER NOT NULL,
+                service TEXT NOT NULL,
+                passenger_name TEXT NOT NULL,
+                passenger_count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'submitted',
+                notes TEXT DEFAULT '',
+                assigned_to TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY,
                 actor_email TEXT,
@@ -134,7 +165,7 @@ def seed_users() -> None:
             email = str(user.get("email", "")).strip().lower()
             password = str(user.get("password", ""))
             role = str(user.get("role", "staff")).strip().lower()
-            if email and password and role in {"admin", "manager", "staff"}:
+            if email and password and role in {"admin", "manager", "staff", "agent_owner", "agent_staff", "applicant"}:
                 database.execute("INSERT OR IGNORE INTO users (email, password_hash, role) VALUES (?, ?, ?)", (email, hash_password(password), role))
 
 
@@ -242,6 +273,13 @@ class API(BaseHTTPRequestHandler):
             return False
         return True
 
+    def agency_for_user(self) -> sqlite3.Row | None:
+        user = self.current_user()
+        if not user:
+            return None
+        with connection() as database:
+            return database.execute("SELECT a.*, am.agency_role FROM agencies a JOIN agency_members am ON am.agency_id = a.id WHERE am.user_id = ?", (user["id"],)).fetchone()
+
     def do_GET(self) -> None:
         if not self.rate_allowed():
             return
@@ -268,6 +306,30 @@ class API(BaseHTTPRequestHandler):
             with connection() as database:
                 users = database.execute("SELECT id, email, role, created_at FROM users ORDER BY id").fetchall()
             self.send_json(HTTPStatus.OK, {"users": [dict(item) for item in users], "count": len(users), "max_users": MAX_USERS})
+            return
+        if path == "/api/agencies":
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Manager access required"})
+                return
+            with connection() as database:
+                agencies = database.execute("SELECT id, legal_name, business_email, mobile, gst_number, status, credit_limit_paise, wallet_paise, approved_by, created_at FROM agencies ORDER BY created_at DESC").fetchall()
+            self.send_json(HTTPStatus.OK, {"agencies": [dict(item) for item in agencies]})
+            return
+        if path == "/api/agency/me":
+            if not self.require_user():
+                return
+            agency = self.agency_for_user()
+            self.send_json(HTTPStatus.OK, {"agency": dict(agency) if agency else None})
+            return
+        if path == "/api/agency/applications":
+            agency = self.agency_for_user()
+            if not agency or agency["status"] != "approved":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Approved agency access required"})
+                return
+            with connection() as database:
+                applications = database.execute("SELECT * FROM agency_applications WHERE agency_id = ? ORDER BY updated_at DESC", (agency["id"],)).fetchall()
+            self.send_json(HTTPStatus.OK, {"applications": [dict(item) for item in applications]})
             return
         if path == "/api/cases":
             if not self.require_user():
@@ -341,6 +403,24 @@ class API(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"authenticated": True, "role": user["role"]}).encode())
             return
+        if path == "/api/agents/register":
+            legal_name = str(payload.get("agency_name", "")).strip()
+            email = str(payload.get("email", "")).strip().lower()
+            mobile = str(payload.get("mobile", "")).strip()
+            password = str(payload.get("password", ""))
+            if not legal_name or not email or not mobile or len(password) < 12:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "agency_name, email, mobile and a password of at least 12 characters are required"})
+                return
+            try:
+                with connection() as database:
+                    agency = database.execute("INSERT INTO agencies (legal_name, business_email, mobile, gst_number) VALUES (?, ?, ?, ?) RETURNING id", (legal_name, email, mobile, str(payload.get("gst_number", "")))).fetchone()
+                    user = database.execute("INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'agent_owner') RETURNING id", (email, hash_password(password))).fetchone()
+                    database.execute("INSERT INTO agency_members (user_id, agency_id, agency_role) VALUES (?, ?, 'owner')", (user["id"], agency["id"]))
+            except sqlite3.IntegrityError:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "An agency or account with that email already exists"})
+                return
+            self.send_json(HTTPStatus.CREATED, {"registered": True, "agency_id": agency["id"], "status": "pending"})
+            return
         if path == "/api/logout":
             if not self.csrf_valid():
                 self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
@@ -375,6 +455,40 @@ class API(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.CONFLICT, {"error": "A user with that email already exists"})
                     return
             self.send_json(HTTPStatus.CREATED, {"created": True, "email": email, "role": role})
+            return
+        if path == "/api/agencies/approve":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Manager access required"})
+                return
+            agency_id = int(payload.get("agency_id", 0))
+            status = str(payload.get("status", "approved")).lower()
+            if status not in {"approved", "rejected", "pending"} or agency_id <= 0:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "agency_id and valid status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE agencies SET status = ?, approved_by = ? WHERE id = ?", (status, user["email"], agency_id))
+            self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "agency_id": agency_id, "status": status})
+            return
+        if path == "/api/agency/applications":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            agency = self.agency_for_user()
+            if not agency or agency["status"] != "approved":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Approved agency access required"})
+                return
+            required = ("service", "passenger_name")
+            if any(not payload.get(field) for field in required):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "service and passenger_name are required"})
+                return
+            reference = f"B2B-{secrets.token_hex(4).upper()}"
+            with connection() as database:
+                database.execute("INSERT INTO agency_applications (reference, agency_id, service, passenger_name, passenger_count, notes) VALUES (?, ?, ?, ?, ?, ?)", (reference, agency["id"], payload["service"], payload["passenger_name"], max(1, int(payload.get("passenger_count", 1))), str(payload.get("notes", ""))))
+            self.send_json(HTTPStatus.CREATED, {"created": True, "reference": reference, "agency_id": agency["id"]})
             return
         if path == "/api/cases":
             if not self.csrf_valid():

@@ -10,6 +10,8 @@ This is a dependency-free development backend for the CRM foundation. It provide
 - Private base64 document upload and metadata listing for PDF/JPG/PNG/WEBP files up to 10 MB
 - Invoice creation/listing and payment-status records
 - WhatsApp Cloud API configuration status endpoint
+- Travel-agent registration, approval and agency profile endpoints
+- Agency owner/staff roles and multi-passenger B2B application records
 - Health and current-user endpoints
 
 Development endpoints:
@@ -24,6 +26,10 @@ Development endpoints:
 - `POST /api/payments/webhook` (HMAC signature required)
 - `POST /api/whatsapp/status`
 - `POST /api/chat` (server-side AI provider proxy with Shukriya service context)
+- `POST /api/agents/register` (creates a pending agency owner account)
+- `GET /api/agencies` and `POST /api/agencies/approve` (admin/manager)
+- `GET /api/agency/me`
+- `GET/POST /api/agency/applications` (approved agency users)
 
 Security controls included in the development foundation:
 
