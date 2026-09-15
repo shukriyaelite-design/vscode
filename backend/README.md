@@ -41,6 +41,9 @@ Security controls included in the development foundation:
 - Secure cookies by default; set `SHUKRIYA_COOKIE_SECURE=false` only for local HTTP development
 - Payment webhook HMAC verification using `PAYMENT_WEBHOOK_SECRET`
 - Role checks for admin user management
+- Agency data isolation by agency membership
+- Suspended-user session rejection
+- Audit records for agency, user, application and invoice events
 
 Document uploads use JSON `content_base64` in development and are stored under `private_storage/`, outside `dist`. This is intentionally not a public download route.
 
@@ -70,4 +73,10 @@ The API listens on `http://127.0.0.1:8010`.
 
 The static website and Python API are separate processes. The live frontend must call the production API URL only after HTTPS, CORS policy, authentication and reverse-proxy routing have been configured.
 
-Agency accounts and verification are implemented in the development foundation. Production readiness still requires HTTPS deployment on the separate cloud server, a persistent session store, malware scanning, private object storage, backups, secrets management, a real payment provider, WhatsApp Cloud API credentials, password reset, two-factor authentication and a full security review. Never store real passports or applicant documents in the public `dist` folder.
+## B2B delivery status
+
+Completed: agent dashboard presentation, owner/staff role foundation, admin-only agency approval, pending/suspended access restriction, duplicate mobile/email/GST protection, staff invitation creation, basic audit logging foundation and live API hydration hooks.
+
+Needs verification: invitation acceptance and expiry/reuse tests, two-approved-agency isolation test, live dashboard API in production, audit assertions for every sensitive operation, password reset, two-factor authentication, malware scanning, private document review, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server.
+
+Production readiness still requires HTTPS deployment on the separate cloud server, a persistent session store, private object storage, backups, secrets management and a full security review. Never store real passports or applicant documents in the public `dist` folder.

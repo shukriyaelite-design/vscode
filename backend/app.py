@@ -64,6 +64,7 @@ def initialise() -> None:
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'staff',
+                status TEXT NOT NULL DEFAULT 'active',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS cases (
@@ -148,6 +149,9 @@ def initialise() -> None:
             database.execute("ALTER TABLE invoices ADD COLUMN gst_number TEXT DEFAULT ''")
         if "gst_amount_paise" not in columns:
             database.execute("ALTER TABLE invoices ADD COLUMN gst_amount_paise INTEGER NOT NULL DEFAULT 0")
+        user_columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
+        if "status" not in user_columns:
+            database.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
 
 
 def seed_admin() -> None:
@@ -275,7 +279,7 @@ class API(BaseHTTPRequestHandler):
         if not user_id:
             return None
         with connection() as database:
-            return database.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            return database.execute("SELECT * FROM users WHERE id = ? AND status = 'active'", (user_id,)).fetchone()
 
     def csrf_valid(self) -> bool:
         token = self.headers.get("X-CSRF-Token", "")
@@ -319,8 +323,17 @@ class API(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
                 return
             with connection() as database:
-                users = database.execute("SELECT id, email, role, created_at FROM users ORDER BY id").fetchall()
+                users = database.execute("SELECT id, email, role, status, created_at FROM users ORDER BY id").fetchall()
             self.send_json(HTTPStatus.OK, {"users": [dict(item) for item in users], "count": len(users), "max_users": MAX_USERS})
+            return
+        if path == "/api/audit":
+            user = self.current_user()
+            if not user or user["role"] != "admin":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
+                return
+            with connection() as database:
+                events = database.execute("SELECT actor_email, action, target, created_at FROM audit_log ORDER BY id DESC LIMIT 200").fetchall()
+            self.send_json(HTTPStatus.OK, {"events": [dict(event) for event in events]})
             return
         if path == "/api/agencies":
             user = self.current_user()
@@ -474,7 +487,26 @@ class API(BaseHTTPRequestHandler):
                 except sqlite3.IntegrityError:
                     self.send_json(HTTPStatus.CONFLICT, {"error": "A user with that email already exists"})
                     return
+            audit(user["email"], "user.created", email)
             self.send_json(HTTPStatus.CREATED, {"created": True, "email": email, "role": role})
+            return
+        if path == "/api/users/status":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] != "admin":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
+                return
+            user_id = int(payload.get("user_id", 0))
+            status = str(payload.get("status", "")).lower()
+            if user_id <= 0 or status not in {"active", "suspended"}:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "user_id and active/suspended status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE users SET status = ? WHERE id = ?", (status, user_id))
+            audit(user["email"], f"user.{status}", str(user_id))
+            self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "user_id": user_id, "status": status})
             return
         if path == "/api/agencies/approve":
             if not self.csrf_valid():
@@ -511,7 +543,10 @@ class API(BaseHTTPRequestHandler):
             with connection() as database:
                 database.execute("INSERT INTO agency_invitations (agency_id, email, token_hash, expires_at) VALUES (?, ?, ?, ?)", (agency["id"], email, hash_password(token), time.time() + 604800))
             audit(user["email"], "agency.staff_invited", email)
-            self.send_json(HTTPStatus.CREATED, {"created": True, "email": email, "expires_in_days": 7, "development_invitation_token": token})
+            response = {"created": True, "email": email, "expires_in_days": 7}
+            if os.environ.get("SHUKRIYA_DEVELOPMENT_MODE", "false").lower() == "true":
+                response["development_invitation_token"] = token
+            self.send_json(HTTPStatus.CREATED, response)
             return
         if path == "/api/agency/invitations/accept":
             email = str(payload.get("email", "")).strip().lower()
