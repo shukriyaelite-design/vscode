@@ -82,7 +82,17 @@ def initialise() -> None:
                 mobile TEXT,
                 status TEXT NOT NULL,
                 notes TEXT DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                priority TEXT NOT NULL DEFAULT 'Normal',
+                source TEXT NOT NULL DEFAULT 'Website',
+                assigned_staff TEXT DEFAULT '',
+                application_date TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                consent_json TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS application_sequences (
+                category TEXT PRIMARY KEY,
+                current_value INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY,
@@ -200,6 +210,16 @@ def initialise() -> None:
         case_columns = {row[1] for row in database.execute("PRAGMA table_info(cases)")}
         if "customer_id" not in case_columns:
             database.execute("ALTER TABLE cases ADD COLUMN customer_id INTEGER")
+        for column, definition in {
+            "details_json": "TEXT NOT NULL DEFAULT '{}'",
+            "priority": "TEXT NOT NULL DEFAULT 'Normal'",
+            "source": "TEXT NOT NULL DEFAULT 'Website'",
+            "assigned_staff": "TEXT DEFAULT ''",
+            "application_date": "TEXT NOT NULL DEFAULT ''",
+            "consent_json": "TEXT NOT NULL DEFAULT '{}'",
+        }.items():
+            if column not in case_columns:
+                database.execute(f"ALTER TABLE cases ADD COLUMN {column} {definition}")
 
 
 def seed_admin() -> None:
@@ -650,14 +670,27 @@ class API(BaseHTTPRequestHandler):
             full_name = str(payload.get("full_name", "")).strip()
             mobile = str(payload.get("mobile", "")).strip()
             service = str(payload.get("service", "")).strip()
-            status = str(payload.get("status", "Documents pending")).strip()
-            if not reference or not full_name or len(mobile) < 8 or not service or status not in {"Documents pending", "In processing", "Ready for submission", "Completed", "Rejected"}:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "reference, full_name, mobile, service and a valid status are required"})
+            status = str(payload.get("status", "New application")).strip()
+            priority = str(payload.get("priority", "Normal")).strip()
+            source = str(payload.get("source", "Website")).strip()
+            consents = payload.get("consents", {})
+            valid_statuses = {"New application", "Documents pending", "Documents received", "Under verification", "In processing", "Ready for submission", "Submitted", "Approved", "Completed", "Rejected", "On hold", "Cancelled"}
+            if not full_name or len(mobile) < 8 or not service or status not in valid_statuses or priority not in {"Normal", "Urgent", "Critical"} or source not in {"Walk-in", "Website", "WhatsApp", "Phone", "Agent", "Existing customer", "Referral"} or not isinstance(consents, dict) or not all(consents.get(key) is True for key in ("processing", "accurate", "documents")):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "full_name, mobile, service, valid workflow fields and required consent are required"})
                 return
+            category = {"Saudi Employment Visa": "SAU", "Wakala Service": "WKL", "Musaned Services": "MUS", "Saudi Umrah Visa": "UMR", "Kuwait Visa Services": "KWT", "Document Attestation": "ATT", "Translation Services": "TRN"}.get(service, "GEN")
             try:
                 with connection() as database:
+                    if not reference:
+                        sequence = database.execute("SELECT current_value FROM application_sequences WHERE category = ?", (category,)).fetchone()
+                        next_value = (sequence["current_value"] if sequence else 0) + 1
+                        database.execute("INSERT INTO application_sequences (category, current_value) VALUES (?, ?) ON CONFLICT(category) DO UPDATE SET current_value = excluded.current_value", (category, next_value))
+                        reference = f"SHK-{category}-{time.strftime('%Y')}-{next_value:05d}"
                     customer = database.execute("INSERT INTO customers (full_name, mobile, email) VALUES (?, ?, ?) RETURNING id", (full_name, mobile, str(payload.get("email", "")).strip().lower())).fetchone()
-                    database.execute("INSERT INTO cases (reference, customer_id, service, applicant_name, mobile, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)", (reference, customer["id"], service, full_name, mobile, status, str(payload.get("notes", "")).strip()))
+                    details = payload.get("details", {})
+                    if not isinstance(details, dict):
+                        details = {}
+                    database.execute("INSERT INTO cases (reference, customer_id, service, applicant_name, mobile, status, notes, details_json, priority, source, assigned_staff, application_date, consent_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (reference, customer["id"], service, full_name, mobile, status, str(details.get("internal_notes", "")), json.dumps(details), priority, source, str(payload.get("assigned_staff", "")), str(payload.get("application_date", time.strftime('%Y-%m-%d'))), json.dumps(consents)))
             except sqlite3.IntegrityError:
                 self.send_json(HTTPStatus.CONFLICT, {"error": "A case with that reference already exists"})
                 return
