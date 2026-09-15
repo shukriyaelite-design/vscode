@@ -7,3 +7,5 @@ backend/private_storage/
 backend/*-test.db
 backend/*-test-storage/
 backend/*.db
+*.env
+!backend/.env.example
