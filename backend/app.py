@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import base64
+import urllib.request
 import time
 import urllib.parse
 from http import HTTPStatus
@@ -166,6 +167,32 @@ def document_bytes(payload: dict) -> tuple[str, bytes]:
     return filename, content
 
 
+SITE_CONTEXT = """You are Shukriya Visa Services assistant. Answer only from this context and be concise.
+Shukriya has supported visa and documentation enquiries from Mumbai since 1977.
+Services: Saudi Employment Visa, Wakala support, Musaned services, Saudi Umrah Visa guidance, Kuwait Visa Services, Saudi visa guidance, document attestation, translation, application tracking and invoices.
+Wakala and Musaned support covers document guidance, employer coordination and submission preparation. Shukriya Travels Wakala details must be confirmed before use.
+Visa approval, processing time and entry decisions are made only by competent authorities. Never promise approval or invent requirements, prices, case statuses, legal advice or payment instructions.
+For a personal case, ask the visitor to use the public tracking page with their reference and registered mobile, or contact contact@shukriya.net / +91 70397 81830. Never request passwords, full passport numbers or payment card details in chat.
+"""
+
+
+def model_reply(message: str) -> dict:
+    api_key = os.environ.get("AI_API_KEY")
+    if not api_key:
+        return {"configured": False, "reply": "AI chat is not configured yet. Please contact Shukriya at contact@shukriya.net or WhatsApp +91 70397 81830."}
+    endpoint = os.environ.get("AI_API_URL", "https://api.openai.com/v1/chat/completions")
+    model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+    request_body = json.dumps({"model": model, "temperature": 0.2, "messages": [{"role": "system", "content": SITE_CONTEXT}, {"role": "user", "content": message[:4000]}]}).encode()
+    request = urllib.request.Request(endpoint, data=request_body, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read())
+        reply = result["choices"][0]["message"]["content"]
+        return {"configured": True, "reply": str(reply)}
+    except (OSError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return {"configured": True, "reply": "The AI assistant is temporarily unavailable. Please contact contact@shukriya.net or WhatsApp +91 70397 81830."}
+
+
 class API(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -267,6 +294,16 @@ class API(BaseHTTPRequestHandler):
             with connection() as database:
                 invoices = database.execute("SELECT id, invoice_number, case_reference, amount_paise, currency, status, created_at FROM invoices ORDER BY created_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"invoices": [dict(invoice) for invoice in invoices]})
+            return
+        if path == "/api/chat":
+            try:
+                payload = body(self)
+                message = str(payload.get("message", "")).strip()
+                if not message:
+                    raise ValueError("message is required")
+                self.send_json(HTTPStatus.OK, model_reply(message))
+            except (ValueError, json.JSONDecodeError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "A message is required"})
             return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 

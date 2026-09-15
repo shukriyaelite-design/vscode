@@ -23,6 +23,7 @@ Development endpoints:
 - `POST /api/payments/status`
 - `POST /api/payments/webhook` (HMAC signature required)
 - `POST /api/whatsapp/status`
+- `POST /api/chat` (server-side AI provider proxy with Shukriya service context)
 
 Security controls included in the development foundation:
 
