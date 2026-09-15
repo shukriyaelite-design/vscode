@@ -653,6 +653,49 @@ class API(BaseHTTPRequestHandler):
             audit(user["email"], "followup.created", case_reference)
             self.send_json(HTTPStatus.CREATED, {"created": True})
             return
+        if path == "/api/cases/status":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            reference = str(payload.get("reference", "")).strip()
+            status = str(payload.get("status", "")).strip()
+            allowed_statuses = {"Documents pending", "In processing", "Ready for submission", "Completed", "Rejected"}
+            if not reference or status not in allowed_statuses:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "reference and a valid status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE cases SET status = ?, notes = ?, updated_at = CURRENT_TIMESTAMP WHERE reference = ?", (status, str(payload.get("notes", "")).strip(), reference))
+            if result.rowcount != 1:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Case not found"})
+                return
+            audit(user["email"], "case.status_changed", f"{reference}:{status}")
+            self.send_json(HTTPStatus.OK, {"updated": True, "reference": reference, "status": status})
+            return
+        if path == "/api/followups/status":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            followup_id = int(payload.get("followup_id", 0))
+            status = str(payload.get("status", "")).strip().lower()
+            if followup_id <= 0 or status not in {"open", "completed", "snoozed"}:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "followup_id and a valid status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE followups SET status = ? WHERE id = ?", (status, followup_id))
+            if result.rowcount != 1:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Follow-up not found"})
+                return
+            audit(user["email"], "followup.status_changed", f"{followup_id}:{status}")
+            self.send_json(HTTPStatus.OK, {"updated": True, "followup_id": followup_id, "status": status})
+            return
         if path == "/api/logout":
             if not self.csrf_valid():
                 self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
