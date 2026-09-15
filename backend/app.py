@@ -29,6 +29,7 @@ RATE_LIMIT_COUNT = int(os.environ.get("SHUKRIYA_RATE_LIMIT_COUNT", "60"))
 RATE_LIMIT_WINDOW = int(os.environ.get("SHUKRIYA_RATE_LIMIT_WINDOW", "60"))
 COOKIE_SECURE = os.environ.get("SHUKRIYA_COOKIE_SECURE", "true").lower() == "true"
 ENVIRONMENT = os.environ.get("SHUKRIYA_ENVIRONMENT", "development")
+SESSION_DAYS = int(os.environ.get("SHUKRIYA_SESSION_DAYS", "7"))
 SESSIONS: dict[str, int] = {}
 CSRF_TOKENS: dict[str, str] = {}
 LOGIN_FAILURES: dict[str, tuple[int, float]] = {}
@@ -93,6 +94,13 @@ def initialise() -> None:
             CREATE TABLE IF NOT EXISTS application_sequences (
                 category TEXT PRIMARY KEY,
                 current_value INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                csrf_token TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY,
@@ -298,6 +306,10 @@ def audit(actor_email: str, action: str, target: str = "") -> None:
         database.execute("INSERT INTO audit_log (actor_email, action, target) VALUES (?, ?, ?)", (actor_email, action, target))
 
 
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 SITE_CONTEXT = """You are Shukriya Visa Services assistant. Answer only from this context and be concise.
 Shukriya has supported visa and documentation enquiries from Mumbai since 1977.
 Services: Saudi Employment Visa, Wakala support, Musaned services, Saudi Umrah Visa guidance, Kuwait Visa Services, Saudi visa guidance, document attestation, translation, application tracking and invoices.
@@ -357,15 +369,25 @@ class API(BaseHTTPRequestHandler):
     def current_user(self) -> sqlite3.Row | None:
         token = self.headers.get("Cookie", "").replace("shukriya_session=", "").split(";", 1)[0]
         user_id = SESSIONS.get(token)
-        if not user_id:
-            return None
         with connection() as database:
+            if not user_id:
+                session = database.execute("SELECT user_id FROM sessions WHERE token_hash = ? AND expires_at > ?", (token_hash(token), time.time())).fetchone()
+                user_id = session["user_id"] if session else None
+            if not user_id:
+                return None
             return database.execute("SELECT * FROM users WHERE id = ? AND status = 'active'", (user_id,)).fetchone()
 
     def csrf_valid(self) -> bool:
         token = self.headers.get("X-CSRF-Token", "")
         session = self.headers.get("Cookie", "").replace("shukriya_session=", "").split(";", 1)[0]
-        return bool(token and hmac.compare_digest(token, CSRF_TOKENS.get(session, "")))
+        if not token or not session:
+            return False
+        expected = CSRF_TOKENS.get(session, "")
+        if expected:
+            return hmac.compare_digest(token, expected)
+        with connection() as database:
+            stored = database.execute("SELECT csrf_token FROM sessions WHERE token_hash = ? AND expires_at > ?", (token_hash(session), time.time())).fetchone()
+        return bool(stored and hmac.compare_digest(token, stored["csrf_token"]))
 
     def require_user(self) -> bool:
         if self.current_user() is None:
@@ -423,10 +445,14 @@ class API(BaseHTTPRequestHandler):
             return
         if path == "/api/csrf":
             session = self.headers.get("Cookie", "").replace("shukriya_session=", "").split(";", 1)[0]
-            if session not in SESSIONS:
+            if not self.current_user():
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Authentication required"})
                 return
-            self.send_json(HTTPStatus.OK, {"csrf_token": CSRF_TOKENS[session]})
+            csrf_token = CSRF_TOKENS.get(session, secrets.token_urlsafe(32))
+            CSRF_TOKENS[session] = csrf_token
+            with connection() as database:
+                database.execute("UPDATE sessions SET csrf_token = ? WHERE token_hash = ?", (csrf_token, token_hash(session)))
+            self.send_json(HTTPStatus.OK, {"csrf_token": csrf_token})
             return
         if path == "/api/users":
             user = self.current_user()
@@ -608,12 +634,15 @@ class API(BaseHTTPRequestHandler):
                 return
             LOGIN_FAILURES.pop(email, None)
             token = secrets.token_urlsafe(32)
+            csrf_token = secrets.token_urlsafe(32)
             SESSIONS[token] = user["id"]
-            CSRF_TOKENS[token] = secrets.token_urlsafe(32)
+            CSRF_TOKENS[token] = csrf_token
+            with connection() as database:
+                database.execute("INSERT INTO sessions (token_hash, user_id, csrf_token, expires_at) VALUES (?, ?, ?, ?)", (token_hash(token), user["id"], csrf_token, time.time() + SESSION_DAYS * 86400))
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json")
             secure = "; Secure" if COOKIE_SECURE else ""
-            self.send_header("Set-Cookie", f"shukriya_session={token}; HttpOnly; SameSite=Strict{secure}; Path=/")
+            self.send_header("Set-Cookie", f"shukriya_session={token}; HttpOnly; SameSite=Strict{secure}; Max-Age={SESSION_DAYS * 86400}; Path=/")
             self.end_headers()
             self.wfile.write(json.dumps({"authenticated": True, "role": user["role"]}).encode())
             return
@@ -766,6 +795,8 @@ class API(BaseHTTPRequestHandler):
             token = self.headers.get("Cookie", "").replace("shukriya_session=", "").split(";", 1)[0]
             SESSIONS.pop(token, None)
             CSRF_TOKENS.pop(token, None)
+            with connection() as database:
+                database.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),))
             self.send_json(HTTPStatus.OK, {"authenticated": False})
             return
         if path == "/api/users":
