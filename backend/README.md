@@ -21,6 +21,7 @@ Development endpoints:
 - `GET/POST /api/cases`
 - `GET/POST /api/users` (admin only; maximum five users by default)
 - `GET/POST /api/documents`
+- `POST /api/documents/review` (staff/manager/admin review status)
 - `GET/POST /api/invoices`
 - `POST /api/payments/status`
 - `POST /api/payments/webhook` (HMAC signature required)
@@ -77,6 +78,6 @@ The static website and Python API are separate processes. The live frontend must
 
 Completed: agent dashboard presentation, owner/staff role foundation, admin-only agency approval, pending/suspended access restriction, duplicate mobile/email/GST protection, staff invitation creation, basic audit logging foundation and live API hydration hooks.
 
-Needs verification: invitation acceptance and expiry/reuse tests, two-approved-agency isolation test, live dashboard API in production, audit assertions for every sensitive operation, password reset, two-factor authentication, malware scanning, private document review, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server.
+Needs verification: live dashboard API in production, audit assertions for every sensitive operation, password reset, two-factor authentication, malware scanning, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server. Invitation acceptance/reuse, duplicate email/GST, two-approved-agency isolation and suspended-session tests have been exercised in the isolated development suite.
 
 Production readiness still requires HTTPS deployment on the separate cloud server, a persistent session store, private object storage, backups, secrets management and a full security review. Never store real passports or applicant documents in the public `dist` folder.

@@ -80,6 +80,7 @@ def initialise() -> None:
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY,
                 case_reference TEXT NOT NULL,
+                agency_id INTEGER,
                 filename TEXT NOT NULL,
                 storage_key TEXT NOT NULL,
                 review_status TEXT NOT NULL DEFAULT 'pending',
@@ -149,6 +150,9 @@ def initialise() -> None:
             database.execute("ALTER TABLE invoices ADD COLUMN gst_number TEXT DEFAULT ''")
         if "gst_amount_paise" not in columns:
             database.execute("ALTER TABLE invoices ADD COLUMN gst_amount_paise INTEGER NOT NULL DEFAULT 0")
+        document_columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
+        if "agency_id" not in document_columns:
+            database.execute("ALTER TABLE documents ADD COLUMN agency_id INTEGER")
         user_columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
         if "status" not in user_columns:
             database.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
@@ -369,11 +373,20 @@ class API(BaseHTTPRequestHandler):
         if path == "/api/documents":
             if not self.require_user():
                 return
+            user = self.current_user()
             reference = urlparse(self.path).query
             query_reference = reference.removeprefix("case_reference=") if reference.startswith("case_reference=") else ""
             with connection() as database:
-                if query_reference:
+                agency = self.agency_for_user() if user["role"] in {"agent_owner", "agent_staff"} else None
+                if user["role"] in {"agent_owner", "agent_staff"} and not agency:
+                    self.send_json(HTTPStatus.FORBIDDEN, {"error": "Agency membership required"})
+                    return
+                if query_reference and agency:
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE case_reference = ? AND agency_id = ? ORDER BY created_at DESC", (query_reference, agency["id"])).fetchall()
+                elif query_reference:
                     documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE case_reference = ? ORDER BY created_at DESC", (query_reference,)).fetchall()
+                elif agency:
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE agency_id = ? ORDER BY created_at DESC", (agency["id"],)).fetchall()
                 else:
                     documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents ORDER BY created_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"documents": [dict(document) for document in documents]})
@@ -617,11 +630,41 @@ class API(BaseHTTPRequestHandler):
             if not case_reference:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "case_reference is required"})
                 return
+            user = self.current_user()
+            agency = self.agency_for_user() if user["role"] in {"agent_owner", "agent_staff"} else None
+            if user["role"] in {"agent_owner", "agent_staff"}:
+                if not agency or agency["status"] != "approved":
+                    self.send_json(HTTPStatus.FORBIDDEN, {"error": "Approved agency access required"})
+                    return
+                with connection() as database:
+                    application = database.execute("SELECT id FROM agency_applications WHERE reference = ? AND agency_id = ?", (case_reference, agency["id"])).fetchone()
+                if not application:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "Application not found for this agency"})
+                    return
             storage_key = f"{secrets.token_urlsafe(18)}{Path(filename).suffix.lower()}"
             (PRIVATE_STORAGE / storage_key).write_bytes(content)
             with connection() as database:
-                database.execute("INSERT INTO documents (case_reference, filename, storage_key) VALUES (?, ?, ?)", (case_reference, filename, storage_key))
+                database.execute("INSERT INTO documents (case_reference, agency_id, filename, storage_key) VALUES (?, ?, ?, ?)", (case_reference, agency["id"] if agency else None, filename, storage_key))
+            audit(user["email"], "document.uploaded", case_reference)
             self.send_json(HTTPStatus.CREATED, {"uploaded": True, "case_reference": case_reference, "filename": filename})
+            return
+        if path == "/api/documents/review":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            document_id = int(payload.get("document_id", 0))
+            status = str(payload.get("review_status", "")).lower()
+            if document_id <= 0 or status not in {"pending", "approved", "rejected"}:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "document_id and a valid review_status are required"})
+                return
+            with connection() as database:
+                result = database.execute("UPDATE documents SET review_status = ? WHERE id = ?", (status, document_id))
+            audit(user["email"], f"document.{status}", str(document_id))
+            self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "document_id": document_id, "review_status": status})
             return
         if path == "/api/invoices":
             if not self.csrf_valid():
