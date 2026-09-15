@@ -4,4 +4,6 @@ __pycache__/
 *.pyc
 backend/*.db
 backend/private_storage/
+backend/*-test.db
+backend/*-test-storage/
 backend/*.db
