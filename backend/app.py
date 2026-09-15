@@ -960,6 +960,27 @@ class API(BaseHTTPRequestHandler):
             configured = bool(os.environ.get("WHATSAPP_ACCESS_TOKEN") and os.environ.get("WHATSAPP_PHONE_NUMBER_ID"))
             self.send_json(HTTPStatus.OK, {"configured": configured, "provider": "whatsapp-cloud-api" if configured else "unconfigured", "message": "Configure WhatsApp environment variables before enabling automated messages."})
             return
+        if path == "/api/whatsapp/send":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] != "admin":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
+                return
+            mobile = str(payload.get("mobile", "")).strip()
+            template_name = str(payload.get("template_name", "")).strip()
+            consent = bool(payload.get("consent", False))
+            if len(mobile) < 8 or not template_name or not consent:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "mobile, approved template_name and recorded consent are required"})
+                return
+            configured = bool(os.environ.get("WHATSAPP_ACCESS_TOKEN") and os.environ.get("WHATSAPP_PHONE_NUMBER_ID"))
+            status = "queued" if configured else "blocked_unconfigured"
+            with connection() as database:
+                message = database.execute("INSERT INTO whatsapp_messages (mobile, template_name, status, attempts, consent_at) VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP) RETURNING id", (mobile, template_name, status)).fetchone()
+            audit(user["email"], "whatsapp.message_queued", str(message["id"]))
+            self.send_json(HTTPStatus.ACCEPTED, {"queued": configured, "message_id": message["id"], "status": status})
+            return
         if path == "/api/payments/webhook":
             secret = os.environ.get("PAYMENT_WEBHOOK_SECRET", "")
             signature = self.headers.get("X-Payment-Signature", "")
