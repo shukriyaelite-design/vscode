@@ -10,6 +10,8 @@ import base64
 import urllib.request
 import time
 import urllib.parse
+import shutil
+import subprocess
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +20,7 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 DATABASE = Path(os.environ.get("SHUKRIYA_DB", ROOT / "shukriya.db"))
 PRIVATE_STORAGE = Path(os.environ.get("SHUKRIYA_PRIVATE_STORAGE", ROOT / "private_storage"))
+QUARANTINE_STORAGE = Path(os.environ.get("SHUKRIYA_QUARANTINE_STORAGE", ROOT / "quarantine_storage"))
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_USERS = int(os.environ.get("SHUKRIYA_MAX_USERS", "5"))
 LOGIN_MAX_ATTEMPTS = int(os.environ.get("SHUKRIYA_LOGIN_MAX_ATTEMPTS", "5"))
@@ -29,6 +32,7 @@ SESSIONS: dict[str, int] = {}
 CSRF_TOKENS: dict[str, str] = {}
 LOGIN_FAILURES: dict[str, tuple[int, float]] = {}
 RATE_BUCKETS: dict[str, list[float]] = {}
+DOWNLOAD_TOKENS: dict[str, tuple[int, float]] = {}
 
 
 def connection() -> sqlite3.Connection:
@@ -56,6 +60,7 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def initialise() -> None:
     PRIVATE_STORAGE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    QUARANTINE_STORAGE.mkdir(mode=0o700, parents=True, exist_ok=True)
     with connection() as database:
         database.executescript(
             """
@@ -84,6 +89,8 @@ def initialise() -> None:
                 filename TEXT NOT NULL,
                 storage_key TEXT NOT NULL,
                 review_status TEXT NOT NULL DEFAULT 'pending',
+                scan_status TEXT NOT NULL DEFAULT 'quarantine',
+                deleted_at TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS invoices (
@@ -153,6 +160,10 @@ def initialise() -> None:
         document_columns = {row[1] for row in database.execute("PRAGMA table_info(documents)")}
         if "agency_id" not in document_columns:
             database.execute("ALTER TABLE documents ADD COLUMN agency_id INTEGER")
+        if "scan_status" not in document_columns:
+            database.execute("ALTER TABLE documents ADD COLUMN scan_status TEXT NOT NULL DEFAULT 'quarantine'")
+        if "deleted_at" not in document_columns:
+            database.execute("ALTER TABLE documents ADD COLUMN deleted_at TEXT DEFAULT ''")
         user_columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
         if "status" not in user_columns:
             database.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
@@ -204,6 +215,8 @@ def clean_filename(filename: str) -> str:
 
 def document_bytes(payload: dict) -> tuple[str, bytes]:
     filename = clean_filename(str(payload.get("filename", "")))
+    if filename.count(".") != 1:
+        raise ValueError("Double extensions are not accepted")
     extension = Path(filename).suffix.lower()
     if extension not in {".pdf", ".jpg", ".jpeg", ".png", ".webp"}:
         raise ValueError("Only PDF, JPG, PNG and WEBP documents are accepted")
@@ -213,7 +226,18 @@ def document_bytes(payload: dict) -> tuple[str, bytes]:
         raise ValueError("content_base64 must be valid base64") from None
     if not content or len(content) > MAX_DOCUMENT_BYTES:
         raise ValueError("Document must be between 1 byte and 10 MB")
+    signatures = {".pdf": content.startswith(b"%PDF-"), ".jpg": content.startswith(b"\xff\xd8\xff"), ".jpeg": content.startswith(b"\xff\xd8\xff"), ".png": content.startswith(b"\x89PNG\r\n\x1a\n"), ".webp": content.startswith(b"RIFF") and content[8:12] == b"WEBP"}
+    if not signatures[extension] or b"<svg" in content[:2048].lower():
+        raise ValueError("File content does not match the allowed document type")
     return filename, content
+
+
+def scan_file(path: Path) -> str:
+    scanner = shutil.which("clamscan")
+    if not scanner:
+        return "quarantine"
+    result = subprocess.run([scanner, "--no-summary", str(path)], capture_output=True, timeout=60, check=False)
+    return "clean" if result.returncode == 0 else "infected"
 
 
 def audit(actor_email: str, action: str, target: str = "") -> None:
@@ -303,6 +327,21 @@ class API(BaseHTTPRequestHandler):
         with connection() as database:
             return database.execute("SELECT a.*, am.agency_role FROM agencies a JOIN agency_members am ON am.agency_id = a.id WHERE am.user_id = ?", (user["id"],)).fetchone()
 
+    def authorized_document(self, document_id: int) -> sqlite3.Row | None:
+        user = self.current_user()
+        if not user:
+            return None
+        with connection() as database:
+            document = database.execute("SELECT * FROM documents WHERE id = ? AND deleted_at = ''", (document_id,)).fetchone()
+        if not document:
+            return None
+        if user["role"] in {"admin", "manager", "staff"}:
+            return document
+        agency = self.agency_for_user()
+        if user["role"] in {"agent_owner", "agent_staff"} and agency and agency["status"] == "approved" and document["agency_id"] == agency["id"]:
+            return document
+        return None
+
     def do_GET(self) -> None:
         if not self.rate_allowed():
             return
@@ -382,14 +421,37 @@ class API(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.FORBIDDEN, {"error": "Agency membership required"})
                     return
                 if query_reference and agency:
-                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE case_reference = ? AND agency_id = ? ORDER BY created_at DESC", (query_reference, agency["id"])).fetchall()
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, scan_status, created_at FROM documents WHERE case_reference = ? AND agency_id = ? AND deleted_at = '' ORDER BY created_at DESC", (query_reference, agency["id"])).fetchall()
                 elif query_reference:
-                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE case_reference = ? ORDER BY created_at DESC", (query_reference,)).fetchall()
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, scan_status, created_at FROM documents WHERE case_reference = ? AND deleted_at = '' ORDER BY created_at DESC", (query_reference,)).fetchall()
                 elif agency:
-                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents WHERE agency_id = ? ORDER BY created_at DESC", (agency["id"],)).fetchall()
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, scan_status, created_at FROM documents WHERE agency_id = ? AND deleted_at = '' ORDER BY created_at DESC", (agency["id"],)).fetchall()
                 else:
-                    documents = database.execute("SELECT id, case_reference, filename, review_status, created_at FROM documents ORDER BY created_at DESC").fetchall()
+                    documents = database.execute("SELECT id, case_reference, filename, review_status, scan_status, created_at FROM documents WHERE deleted_at = '' ORDER BY created_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"documents": [dict(document) for document in documents]})
+            return
+        if path == "/api/documents/download":
+            token = urlparse(self.path).query.removeprefix("token=")
+            token_data = DOWNLOAD_TOKENS.pop(token, None)
+            if not token_data or token_data[1] < time.time():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Download link expired or invalid"})
+                return
+            document = self.authorized_document(token_data[0])
+            if not document or document["scan_status"] != "clean" or document["review_status"] == "rejected":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Document is not available"})
+                return
+            file_path = PRIVATE_STORAGE / document["storage_key"]
+            if not file_path.is_file():
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "Document file not found"})
+                return
+            content = file_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(document['filename'])}")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
         if path == "/api/invoices":
             if not self.require_user():
@@ -642,11 +704,29 @@ class API(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "Application not found for this agency"})
                     return
             storage_key = f"{secrets.token_urlsafe(18)}{Path(filename).suffix.lower()}"
-            (PRIVATE_STORAGE / storage_key).write_bytes(content)
+            quarantine_path = QUARANTINE_STORAGE / storage_key
+            quarantine_path.write_bytes(content)
+            scan_status = scan_file(quarantine_path)
+            if scan_status == "infected":
+                quarantine_path.unlink(missing_ok=True)
             with connection() as database:
-                database.execute("INSERT INTO documents (case_reference, agency_id, filename, storage_key) VALUES (?, ?, ?, ?)", (case_reference, agency["id"] if agency else None, filename, storage_key))
+                database.execute("INSERT INTO documents (case_reference, agency_id, filename, storage_key, scan_status) VALUES (?, ?, ?, ?, ?)", (case_reference, agency["id"] if agency else None, filename, storage_key, scan_status))
+            if scan_status == "clean":
+                shutil.move(str(quarantine_path), str(PRIVATE_STORAGE / storage_key))
             audit(user["email"], "document.uploaded", case_reference)
-            self.send_json(HTTPStatus.CREATED, {"uploaded": True, "case_reference": case_reference, "filename": filename})
+            self.send_json(HTTPStatus.CREATED, {"uploaded": True, "case_reference": case_reference, "filename": filename, "scan_status": scan_status})
+            return
+        if path == "/api/documents/link":
+            if not self.csrf_valid() or not self.require_user():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Authentication and CSRF validation required"})
+                return
+            document = self.authorized_document(int(payload.get("document_id", 0)))
+            if not document or document["scan_status"] != "clean" or document["review_status"] == "rejected":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Document is not available"})
+                return
+            token = secrets.token_urlsafe(32)
+            DOWNLOAD_TOKENS[token] = (document["id"], time.time() + 300)
+            self.send_json(HTTPStatus.CREATED, {"expires_in_seconds": 300, "download_path": f"/api/documents/download?token={token}"})
             return
         if path == "/api/documents/review":
             if not self.csrf_valid():
@@ -660,6 +740,11 @@ class API(BaseHTTPRequestHandler):
             status = str(payload.get("review_status", "")).lower()
             if document_id <= 0 or status not in {"pending", "approved", "rejected"}:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "document_id and a valid review_status are required"})
+                return
+            with connection() as database:
+                document = database.execute("SELECT scan_status FROM documents WHERE id = ? AND deleted_at = ''", (document_id,)).fetchone()
+            if not document or document["scan_status"] != "clean":
+                self.send_json(HTTPStatus.CONFLICT, {"error": "Document must pass malware scanning before review"})
                 return
             with connection() as database:
                 result = database.execute("UPDATE documents SET review_status = ? WHERE id = ?", (status, document_id))

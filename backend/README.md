@@ -8,6 +8,8 @@ This is a dependency-free development backend for the CRM foundation. It provide
 - Admin-only user list and user creation
 - CRM case listing and creation
 - Private base64 document upload and metadata listing for PDF/JPG/PNG/WEBP files up to 10 MB
+- Quarantine-first uploads with signature checks and optional ClamAV scanning
+- Five-minute authorization-bound document download links
 - Invoice creation/listing and payment-status records
 - WhatsApp Cloud API configuration status endpoint
 - Travel-agent registration, approval and agency profile endpoints
@@ -22,6 +24,7 @@ Development endpoints:
 - `GET/POST /api/users` (admin only; maximum five users by default)
 - `GET/POST /api/documents`
 - `POST /api/documents/review` (staff/manager/admin review status)
+- `POST /api/documents/link` and `GET /api/documents/download?token=...`
 - `GET/POST /api/invoices`
 - `POST /api/payments/status`
 - `POST /api/payments/webhook` (HMAC signature required)
@@ -78,6 +81,8 @@ The static website and Python API are separate processes. The live frontend must
 
 Completed: agent dashboard presentation, owner/staff role foundation, admin-only agency approval, pending/suspended access restriction, duplicate mobile/email/GST protection, staff invitation creation, basic audit logging foundation and live API hydration hooks.
 
-Needs verification: live dashboard API in production, audit assertions for every sensitive operation, password reset, two-factor authentication, malware scanning, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server. Invitation acceptance/reuse, duplicate email/GST, two-approved-agency isolation and suspended-session tests have been exercised in the isolated development suite.
+Needs verification: ClamAV/malware scanning on the production cloud server, password reset, two-factor authentication, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server. Invitation acceptance/reuse, duplicate email/GST, two-approved-agency isolation and suspended-session tests have been exercised in the isolated development suite.
+
+Private document upload and review workflow implemented; malware scanning and production hardening pending.
 
 Production readiness still requires HTTPS deployment on the separate cloud server, a persistent session store, private object storage, backups, secrets management and a full security review. Never store real passports or applicant documents in the public `dist` folder.
