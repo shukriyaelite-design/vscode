@@ -28,6 +28,7 @@ LOGIN_LOCK_SECONDS = int(os.environ.get("SHUKRIYA_LOGIN_LOCK_SECONDS", "900"))
 RATE_LIMIT_COUNT = int(os.environ.get("SHUKRIYA_RATE_LIMIT_COUNT", "60"))
 RATE_LIMIT_WINDOW = int(os.environ.get("SHUKRIYA_RATE_LIMIT_WINDOW", "60"))
 COOKIE_SECURE = os.environ.get("SHUKRIYA_COOKIE_SECURE", "true").lower() == "true"
+ENVIRONMENT = os.environ.get("SHUKRIYA_ENVIRONMENT", "development")
 SESSIONS: dict[str, int] = {}
 CSRF_TOKENS: dict[str, str] = {}
 LOGIN_FAILURES: dict[str, tuple[int, float]] = {}
@@ -148,6 +149,34 @@ def initialise() -> None:
                 actor_email TEXT,
                 action TEXT NOT NULL,
                 target TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS customers (
+                id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                mobile TEXT NOT NULL,
+                email TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS followups (
+                id INTEGER PRIMARY KEY,
+                case_reference TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                note TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                assigned_to TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS whatsapp_messages (
+                id INTEGER PRIMARY KEY,
+                mobile TEXT NOT NULL,
+                template_name TEXT NOT NULL,
+                body TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                provider_message_id TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                consent_at TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -345,9 +374,24 @@ class API(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self.rate_allowed():
             return
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         if path == "/api/health":
-            self.send_json(HTTPStatus.OK, {"ok": True, "environment": "development"})
+            self.send_json(HTTPStatus.OK, {"ok": True, "environment": ENVIRONMENT})
+            return
+        if path == "/api/public/track":
+            reference = query.get("reference", [""])[0].strip()
+            mobile = query.get("mobile", [""])[0].strip()
+            if len(reference) < 5 or len(mobile) < 8:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "A valid reference and registered mobile are required"})
+                return
+            with connection() as database:
+                case = database.execute("SELECT reference, service, status, updated_at FROM cases WHERE reference = ? AND mobile = ?", (reference, mobile)).fetchone()
+            if not case:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "No application matched those details"})
+                return
+            self.send_json(HTTPStatus.OK, {"application": dict(case)})
             return
         if path == "/api/me":
             user = self.current_user()
@@ -408,6 +452,44 @@ class API(BaseHTTPRequestHandler):
             with connection() as database:
                 cases = database.execute("SELECT * FROM cases ORDER BY updated_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"cases": [dict(case) for case in cases]})
+            return
+        if path == "/api/customers":
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            with connection() as database:
+                customers = database.execute("SELECT id, full_name, mobile, email, created_at FROM customers ORDER BY created_at DESC").fetchall()
+            self.send_json(HTTPStatus.OK, {"customers": [dict(customer) for customer in customers]})
+            return
+        if path == "/api/followups":
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            with connection() as database:
+                followups = database.execute("SELECT * FROM followups WHERE status != 'completed' ORDER BY due_at ASC").fetchall()
+            self.send_json(HTTPStatus.OK, {"followups": [dict(followup) for followup in followups]})
+            return
+        if path == "/api/whatsapp/messages":
+            user = self.current_user()
+            if not user or user["role"] != "admin":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
+                return
+            with connection() as database:
+                messages = database.execute("SELECT id, mobile, template_name, status, provider_message_id, error, attempts, consent_at, created_at FROM whatsapp_messages ORDER BY created_at DESC LIMIT 200").fetchall()
+            self.send_json(HTTPStatus.OK, {"messages": [dict(message) for message in messages]})
+            return
+        if path == "/api/whatsapp/webhook":
+            verify_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+            if query.get("hub.verify_token", [""])[0] != verify_token or not verify_token:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Webhook verification failed"})
+                return
+            challenge = query.get("hub.challenge", [""])[0]
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(challenge.encode())
             return
         if path == "/api/documents":
             if not self.require_user():
@@ -533,6 +615,43 @@ class API(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.CONFLICT, {"error": "An agency or account with that email already exists"})
                 return
             self.send_json(HTTPStatus.CREATED, {"registered": True, "agency_id": agency["id"], "status": "pending"})
+            return
+        if path == "/api/customers":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            full_name = str(payload.get("full_name", "")).strip()
+            mobile = str(payload.get("mobile", "")).strip()
+            if not full_name or len(mobile) < 8:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "full_name and a valid mobile are required"})
+                return
+            with connection() as database:
+                database.execute("INSERT INTO customers (full_name, mobile, email) VALUES (?, ?, ?)", (full_name, mobile, str(payload.get("email", "")).strip().lower()))
+            audit(user["email"], "customer.created", mobile)
+            self.send_json(HTTPStatus.CREATED, {"created": True})
+            return
+        if path == "/api/followups":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            case_reference = str(payload.get("case_reference", "")).strip()
+            due_at = str(payload.get("due_at", "")).strip()
+            note = str(payload.get("note", "")).strip()
+            if not case_reference or not due_at or not note:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "case_reference, due_at and note are required"})
+                return
+            with connection() as database:
+                database.execute("INSERT INTO followups (case_reference, due_at, note, assigned_to) VALUES (?, ?, ?, ?)", (case_reference, due_at, note, str(payload.get("assigned_to", "")).strip()))
+            audit(user["email"], "followup.created", case_reference)
+            self.send_json(HTTPStatus.CREATED, {"created": True})
             return
         if path == "/api/logout":
             if not self.csrf_valid():
