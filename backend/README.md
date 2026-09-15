@@ -67,15 +67,15 @@ The API listens on `http://127.0.0.1:8010`.
 
 ## Separate cloud-server deployment shape
 
-1. Upload the contents of `dist` to the public web root on the separate cloud server.
-2. Run `backend/app.py` as a managed Python service on the cloud server.
+1. Upload the contents of `dist` to `/var/www/shukriya/dist` on the separate cloud server.
+2. Run `backend/app.py` as a managed Python service on `127.0.0.1:8010`.
 3. Keep `SHUKRIYA_DB` and `SHUKRIYA_PRIVATE_STORAGE` outside the public web root.
 4. Set `SHUKRIYA_COOKIE_SECURE=true` because SSL is enabled.
 5. Set all values from `.env.example` in the cloud server secret/environment manager, never in HTML or GitHub.
-6. Put the API behind the cloud server HTTPS reverse proxy and restrict `/api` access as required by the deployment.
+6. Install the provided `deploy/nginx/shukriya.net.conf` configuration. It serves the static site and reverse-proxies `/api/` to the private Python service, so the site, CRM, AI chat and uploads all use `https://shukriya.net/`.
 7. Configure daily database/private-storage backups, error logs, uptime monitoring and provider webhooks.
 
-The static website and Python API are separate processes. The live frontend must call the production API URL only after HTTPS, CORS policy, authentication and reverse-proxy routing have been configured.
+The static website and Python API remain separate processes behind one HTTPS domain. Because the browser calls relative `/api/...` paths, no second public API domain or browser CORS configuration is required.
 
 ## B2B delivery status
 
