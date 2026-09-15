@@ -76,6 +76,7 @@ def initialise() -> None:
             CREATE TABLE IF NOT EXISTS cases (
                 id INTEGER PRIMARY KEY,
                 reference TEXT UNIQUE NOT NULL,
+                customer_id INTEGER,
                 service TEXT NOT NULL,
                 applicant_name TEXT NOT NULL,
                 mobile TEXT,
@@ -196,6 +197,9 @@ def initialise() -> None:
         user_columns = {row[1] for row in database.execute("PRAGMA table_info(users)")}
         if "status" not in user_columns:
             database.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        case_columns = {row[1] for row in database.execute("PRAGMA table_info(cases)")}
+        if "customer_id" not in case_columns:
+            database.execute("ALTER TABLE cases ADD COLUMN customer_id INTEGER")
 
 
 def seed_admin() -> None:
@@ -633,6 +637,32 @@ class API(BaseHTTPRequestHandler):
                 database.execute("INSERT INTO customers (full_name, mobile, email) VALUES (?, ?, ?)", (full_name, mobile, str(payload.get("email", "")).strip().lower()))
             audit(user["email"], "customer.created", mobile)
             self.send_json(HTTPStatus.CREATED, {"created": True})
+            return
+        if path == "/api/applicants":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            if not user or user["role"] not in {"admin", "manager", "staff"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Staff access required"})
+                return
+            reference = str(payload.get("reference", "")).strip()
+            full_name = str(payload.get("full_name", "")).strip()
+            mobile = str(payload.get("mobile", "")).strip()
+            service = str(payload.get("service", "")).strip()
+            status = str(payload.get("status", "Documents pending")).strip()
+            if not reference or not full_name or len(mobile) < 8 or not service or status not in {"Documents pending", "In processing", "Ready for submission", "Completed", "Rejected"}:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "reference, full_name, mobile, service and a valid status are required"})
+                return
+            try:
+                with connection() as database:
+                    customer = database.execute("INSERT INTO customers (full_name, mobile, email) VALUES (?, ?, ?) RETURNING id", (full_name, mobile, str(payload.get("email", "")).strip().lower())).fetchone()
+                    database.execute("INSERT INTO cases (reference, customer_id, service, applicant_name, mobile, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?)", (reference, customer["id"], service, full_name, mobile, status, str(payload.get("notes", "")).strip()))
+            except sqlite3.IntegrityError:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "A case with that reference already exists"})
+                return
+            audit(user["email"], "applicant.created", reference)
+            self.send_json(HTTPStatus.CREATED, {"created": True, "reference": reference, "customer_id": customer["id"]})
             return
         if path == "/api/followups":
             if not self.csrf_valid():
