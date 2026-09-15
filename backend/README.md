@@ -27,9 +27,11 @@ Development endpoints:
 - `POST /api/whatsapp/status`
 - `POST /api/chat` (server-side AI provider proxy with Shukriya service context)
 - `POST /api/agents/register` (creates a pending agency owner account)
-- `GET /api/agencies` and `POST /api/agencies/approve` (admin/manager)
+- `GET /api/agencies` (admin/manager) and `POST /api/agencies/approve` (admin only)
 - `GET /api/agency/me`
 - `GET/POST /api/agency/applications` (approved agency users)
+- `POST /api/agency/invitations` (approved agency owner)
+- `POST /api/agency/invitations/accept`
 
 Security controls included in the development foundation:
 
@@ -56,16 +58,16 @@ To seed additional users later, set `SHUKRIYA_USERS_JSON` to a JSON array contai
 
 The API listens on `http://127.0.0.1:8010`.
 
-## HostGator deployment shape
+## Separate cloud-server deployment shape
 
-1. Upload the contents of `dist` to `public_html`.
-2. Use cPanel **Setup Python App** for `backend/app.py`; use the Python version supported by the HostGator account.
-3. Keep `SHUKRIYA_DB` and `SHUKRIYA_PRIVATE_STORAGE` outside `public_html`.
+1. Upload the contents of `dist` to the public web root on the separate cloud server.
+2. Run `backend/app.py` as a managed Python service on the cloud server.
+3. Keep `SHUKRIYA_DB` and `SHUKRIYA_PRIVATE_STORAGE` outside the public web root.
 4. Set `SHUKRIYA_COOKIE_SECURE=true` because SSL is enabled.
-5. Set all values from `.env.example` in the Python App environment-variable panel, never in HTML or GitHub.
-6. Put the API behind the HostGator HTTPS reverse proxy and restrict `/api` access as required by the deployment.
+5. Set all values from `.env.example` in the cloud server secret/environment manager, never in HTML or GitHub.
+6. Put the API behind the cloud server HTTPS reverse proxy and restrict `/api` access as required by the deployment.
 7. Configure daily database/private-storage backups, error logs, uptime monitoring and provider webhooks.
 
 The static website and Python API are separate processes. The live frontend must call the production API URL only after HTTPS, CORS policy, authentication and reverse-proxy routing have been configured.
 
-This is not production-ready. Before deployment, add HTTPS, a persistent session store, CSRF protection, rate limiting, audit logs, private object storage, malware scanning, database backups, secrets management, a real payment provider and WhatsApp Cloud API credentials. Never store real passports or applicant documents in the public `dist` folder. Do not enable automated payments or WhatsApp messages until provider webhooks and consent handling are implemented.
+Agency accounts and verification are implemented in the development foundation. Production readiness still requires HTTPS deployment on the separate cloud server, a persistent session store, malware scanning, private object storage, backups, secrets management, a real payment provider, WhatsApp Cloud API credentials, password reset, two-factor authentication and a full security review. Never store real passports or applicant documents in the public `dist` folder.

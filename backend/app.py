@@ -111,6 +111,16 @@ def initialise() -> None:
                 agency_id INTEGER NOT NULL,
                 agency_role TEXT NOT NULL DEFAULT 'owner'
             );
+            CREATE TABLE IF NOT EXISTS agency_invitations (
+                id INTEGER PRIMARY KEY,
+                agency_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'agent_staff',
+                token_hash TEXT UNIQUE NOT NULL,
+                expires_at REAL NOT NULL,
+                accepted_at TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS agency_applications (
                 id INTEGER PRIMARY KEY,
                 reference TEXT UNIQUE NOT NULL,
@@ -196,6 +206,11 @@ def document_bytes(payload: dict) -> tuple[str, bytes]:
     if not content or len(content) > MAX_DOCUMENT_BYTES:
         raise ValueError("Document must be between 1 byte and 10 MB")
     return filename, content
+
+
+def audit(actor_email: str, action: str, target: str = "") -> None:
+    with connection() as database:
+        database.execute("INSERT INTO audit_log (actor_email, action, target) VALUES (?, ?, ?)", (actor_email, action, target))
 
 
 SITE_CONTEXT = """You are Shukriya Visa Services assistant. Answer only from this context and be concise.
@@ -413,9 +428,14 @@ class API(BaseHTTPRequestHandler):
                 return
             try:
                 with connection() as database:
+                    duplicate = database.execute("SELECT id FROM agencies WHERE business_email = ? OR mobile = ? OR (? <> '' AND gst_number = ?)", (email, mobile, str(payload.get("gst_number", "")).strip(), str(payload.get("gst_number", "")).strip())).fetchone()
+                    if duplicate:
+                        self.send_json(HTTPStatus.CONFLICT, {"error": "An agency with that email, mobile or GST number already exists"})
+                        return
                     agency = database.execute("INSERT INTO agencies (legal_name, business_email, mobile, gst_number) VALUES (?, ?, ?, ?) RETURNING id", (legal_name, email, mobile, str(payload.get("gst_number", "")))).fetchone()
                     user = database.execute("INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'agent_owner') RETURNING id", (email, hash_password(password))).fetchone()
                     database.execute("INSERT INTO agency_members (user_id, agency_id, agency_role) VALUES (?, ?, 'owner')", (user["id"], agency["id"]))
+                audit(email, "agency.registered", str(agency["id"]))
             except sqlite3.IntegrityError:
                 self.send_json(HTTPStatus.CONFLICT, {"error": "An agency or account with that email already exists"})
                 return
@@ -461,8 +481,8 @@ class API(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
                 return
             user = self.current_user()
-            if not user or user["role"] not in {"admin", "manager"}:
-                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Manager access required"})
+            if not user or user["role"] != "admin":
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Admin access required"})
                 return
             agency_id = int(payload.get("agency_id", 0))
             status = str(payload.get("status", "approved")).lower()
@@ -471,7 +491,49 @@ class API(BaseHTTPRequestHandler):
                 return
             with connection() as database:
                 result = database.execute("UPDATE agencies SET status = ?, approved_by = ? WHERE id = ?", (status, user["email"], agency_id))
+            audit(user["email"], f"agency.{status}", str(agency_id))
             self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "agency_id": agency_id, "status": status})
+            return
+        if path == "/api/agency/invitations":
+            if not self.csrf_valid():
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "CSRF validation failed"})
+                return
+            user = self.current_user()
+            agency = self.agency_for_user()
+            if not user or not agency or agency["status"] != "approved" or user["role"] not in {"agent_owner", "admin"}:
+                self.send_json(HTTPStatus.FORBIDDEN, {"error": "Agency owner access required"})
+                return
+            email = str(payload.get("email", "")).strip().lower()
+            if "@" not in email:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "A valid staff email is required"})
+                return
+            token = secrets.token_urlsafe(32)
+            with connection() as database:
+                database.execute("INSERT INTO agency_invitations (agency_id, email, token_hash, expires_at) VALUES (?, ?, ?, ?)", (agency["id"], email, hash_password(token), time.time() + 604800))
+            audit(user["email"], "agency.staff_invited", email)
+            self.send_json(HTTPStatus.CREATED, {"created": True, "email": email, "expires_in_days": 7, "development_invitation_token": token})
+            return
+        if path == "/api/agency/invitations/accept":
+            email = str(payload.get("email", "")).strip().lower()
+            token = str(payload.get("token", ""))
+            password = str(payload.get("password", ""))
+            if not email or len(password) < 12 or not token:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "email, invitation token and a password of at least 12 characters are required"})
+                return
+            with connection() as database:
+                invitation = database.execute("SELECT * FROM agency_invitations WHERE email = ? AND accepted_at = '' ORDER BY id DESC", (email,)).fetchone()
+                if not invitation or invitation["expires_at"] < time.time() or not verify_password(token, invitation["token_hash"]):
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid or expired invitation"})
+                    return
+                try:
+                    user = database.execute("INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'agent_staff') RETURNING id", (email, hash_password(password))).fetchone()
+                    database.execute("INSERT INTO agency_members (user_id, agency_id, agency_role) VALUES (?, ?, 'staff')", (user["id"], invitation["agency_id"]))
+                    database.execute("UPDATE agency_invitations SET accepted_at = CURRENT_TIMESTAMP WHERE id = ?", (invitation["id"],))
+                except sqlite3.IntegrityError:
+                    self.send_json(HTTPStatus.CONFLICT, {"error": "A user with that email already exists"})
+                    return
+            audit(email, "agency.staff_joined", str(invitation["agency_id"]))
+            self.send_json(HTTPStatus.CREATED, {"accepted": True, "role": "agent_staff"})
             return
         if path == "/api/agency/applications":
             if not self.csrf_valid():
@@ -488,6 +550,7 @@ class API(BaseHTTPRequestHandler):
             reference = f"B2B-{secrets.token_hex(4).upper()}"
             with connection() as database:
                 database.execute("INSERT INTO agency_applications (reference, agency_id, service, passenger_name, passenger_count, notes) VALUES (?, ?, ?, ?, ?, ?)", (reference, agency["id"], payload["service"], payload["passenger_name"], max(1, int(payload.get("passenger_count", 1))), str(payload.get("notes", ""))))
+            audit(self.current_user()["email"], "agency.application_created", reference)
             self.send_json(HTTPStatus.CREATED, {"created": True, "reference": reference, "agency_id": agency["id"]})
             return
         if path == "/api/cases":
@@ -539,6 +602,7 @@ class API(BaseHTTPRequestHandler):
             invoice_number = f"SHK-{secrets.token_hex(4).upper()}"
             with connection() as database:
                 database.execute("INSERT INTO invoices (invoice_number, case_reference, amount_paise, currency, status, gst_number, gst_amount_paise) VALUES (?, ?, ?, ?, 'draft', ?, ?)", (invoice_number, case_reference, amount_paise, str(payload.get("currency", "INR")).upper(), str(payload.get("gst_number", "")), int(payload.get("gst_amount_paise", 0))))
+            audit(self.current_user()["email"], "invoice.created", invoice_number)
             self.send_json(HTTPStatus.CREATED, {"created": True, "invoice_number": invoice_number, "status": "draft"})
             return
         if path == "/api/payments/status":
@@ -554,6 +618,7 @@ class API(BaseHTTPRequestHandler):
                 return
             with connection() as database:
                 result = database.execute("UPDATE invoices SET status = ? WHERE invoice_number = ?", (status, invoice_number))
+            audit(self.current_user()["email"], "invoice.payment_status_changed", invoice_number)
             self.send_json(HTTPStatus.OK, {"updated": result.rowcount == 1, "invoice_number": invoice_number, "status": status, "provider": os.environ.get("SHUKRIYA_PAYMENT_PROVIDER", "unconfigured")})
             return
         if path == "/api/whatsapp/status":
