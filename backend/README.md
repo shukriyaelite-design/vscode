@@ -11,6 +11,7 @@ This is a dependency-free development backend for the CRM foundation. It provide
 - Quarantine-first uploads with signature checks and optional ClamAV scanning
 - Five-minute authorization-bound document download links
 - Invoice creation/listing and payment-status records
+- Invoice company profile configuration for Shukriya Travels, GSTIN, PAN and Maharashtra state code
 - WhatsApp Cloud API configuration status endpoint
 - Travel-agent registration, approval and agency profile endpoints
 - Agency owner/staff roles and multi-passenger B2B application records
@@ -81,7 +82,7 @@ The static website and Python API remain separate processes behind one HTTPS dom
 
 Completed: agent dashboard presentation, owner/staff role foundation, admin-only agency approval, pending/suspended access restriction, duplicate mobile/email/GST protection, staff invitation creation, basic audit logging foundation and live API hydration hooks.
 
-Needs verification: ClamAV/malware scanning on the production cloud server, password reset, two-factor authentication, GST PDF invoices, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server. Invitation acceptance/reuse, duplicate email/GST, two-approved-agency isolation and suspended-session tests have been exercised in the isolated development suite.
+Needs verification: ClamAV/malware scanning on the production cloud server, password reset, two-factor authentication, automatic GST PDF invoice generation from the approved template, payment webhooks, WhatsApp/email notifications and deployment to the separate cloud server. Telephone, email and bank details remain intentionally blank until officially supplied. Invitation acceptance/reuse, duplicate email/GST, two-approved-agency isolation and suspended-session tests have been exercised in the isolated development suite.
 
 Private document upload and review workflow implemented; malware scanning and production hardening pending.
 

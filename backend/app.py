@@ -460,6 +460,11 @@ class API(BaseHTTPRequestHandler):
                 invoices = database.execute("SELECT id, invoice_number, case_reference, amount_paise, currency, status, created_at FROM invoices ORDER BY created_at DESC").fetchall()
             self.send_json(HTTPStatus.OK, {"invoices": [dict(invoice) for invoice in invoices]})
             return
+        if path == "/api/invoice-profile":
+            if not self.require_user():
+                return
+            self.send_json(HTTPStatus.OK, {"company_name": os.environ.get("INVOICE_COMPANY_NAME", "Shukriya Travels"), "address": os.environ.get("INVOICE_ADDRESS", "Ali Raza Castle, 486/488, Sir J. J. Road, Byculla, Mumbai - 400008"), "gstin": os.environ.get("INVOICE_GSTIN", "27AACPK5284E1ZR"), "pan": os.environ.get("INVOICE_PAN", "AACPK5284E"), "state_code": os.environ.get("INVOICE_STATE_CODE", "27"), "phone": os.environ.get("INVOICE_PHONE", ""), "email": os.environ.get("INVOICE_EMAIL", ""), "bank_details": os.environ.get("INVOICE_BANK_DETAILS", "")})
+            return
         if path == "/api/chat":
             try:
                 payload = body(self)
